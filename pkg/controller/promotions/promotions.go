@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/kelseyhightower/envconfig"
@@ -73,6 +74,11 @@ type reconciler struct {
 	sender event.Sender
 
 	promoMetrics *metrics.PromotionMetrics
+
+	// ownedWorkDirs holds the UIDs of Promotions whose working directory this
+	// process created. A working directory that exists but is not owned was
+	// left by a previous controller process.
+	ownedWorkDirs sync.Map
 
 	// The following behaviors are overridable for testing purposes:
 
@@ -639,8 +645,15 @@ func (r *reconciler) promote(
 		promoCtx.StartFromStep = 0
 		promoCtx.StepExecutionMetadata = nil
 		workingPromo.Status.HealthChecks = nil
+		r.ownedWorkDirs.Store(workingPromo.UID, struct{}{})
 	} else if !os.IsExist(err) {
 		return nil, nil, fmt.Errorf("error creating working directory: %w", err)
+	} else if _, owned := r.ownedWorkDirs.Load(workingPromo.UID); !owned {
+		// The directory survived a restart of this container (e.g. an OOM kill)
+		// and may hold a step's partial output. Resuming could also re-run
+		// whatever killed the previous process, so stop here.
+		markInterruptedByRestart(&workingPromo.Status)
+		return &workingPromo.Status, nil, nil
 	}
 	res, err := r.promoEngine.Promote(ctx, promoCtx, steps)
 	workingPromo.Status.Phase = res.Status
@@ -856,10 +869,28 @@ func promotionWorkDir(promoUID types.UID) string {
 	return filepath.Join(os.TempDir(), "promotion-"+string(promoUID))
 }
 
+// markInterruptedByRestart errors a Promotion whose steps were running in a
+// controller process that no longer exists.
+func markInterruptedByRestart(status *kargoapi.PromotionStatus) {
+	msg := "promotion was interrupted by a controller restart"
+	if i := status.CurrentStep; i >= 0 && int(i) < len(status.StepExecutionMetadata) {
+		md := &status.StepExecutionMetadata[i]
+		msg = fmt.Sprintf("step %q was interrupted by a controller restart", md.Alias)
+		if md.FinishedAt == nil {
+			md.Status = kargoapi.PromotionStepStatusErrored
+			md.Message = msg
+			md.FinishedAt = &metav1.Time{Time: time.Now()}
+		}
+	}
+	status.Phase = kargoapi.PromotionPhaseErrored
+	status.Message = msg + "; not resuming, as the restart may have been caused by this promotion"
+}
+
 // cleanupWorkDir removes the temporary working directory for a Promotion.
 // This is safe to call even if the directory does not exist.
 func (r *reconciler) cleanupWorkDir(ctx context.Context, promoUID types.UID) {
 	workDir := promotionWorkDir(promoUID)
+	r.ownedWorkDirs.Delete(promoUID)
 	logger := logging.LoggerFromContext(ctx)
 	logger.Debug("removing promotion working directory", "path", workDir)
 	if err := os.RemoveAll(workDir); err != nil {
